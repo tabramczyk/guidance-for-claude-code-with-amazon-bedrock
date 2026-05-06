@@ -80,6 +80,12 @@ Resources:
           Value: ClaudeCodeWithBedrock
         - Key: Purpose
           Value: GeneratePresignedURLs
+        - Key: Namespace
+          Value: ci
+        - Key: ContactEmails
+          Value: devenv-tech@ringieraxelspringer.pl
+        - Key: CAPABILITY_AUTOMATION
+          Value: 'true'
 
   # Access key for distribution user
   DistributionUserAccessKey:
