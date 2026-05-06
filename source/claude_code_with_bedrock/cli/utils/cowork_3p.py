@@ -117,6 +117,7 @@ except Exception as e:
     print(json.dumps({{"error": str(e)}}), file=sys.stderr)
     sys.exit(1)
 '''
+    base_dir.mkdir(parents=True, exist_ok=True)
     wrapper_path.write_text(script)
     wrapper_path.chmod(0o755)
     return wrapper_path

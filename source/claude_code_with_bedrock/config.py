@@ -68,6 +68,7 @@ class Profile:
     # Federation configuration
     federation_type: str = "cognito"  # "cognito" or "direct"
     federated_role_arn: str | None = None  # ARN for Direct STS federation
+    existing_oidc_provider_arn: str | None = None  # ARN of an existing IAM OIDC provider to reuse instead of creating one
     max_session_duration: int = 28800  # 8 hours default, 43200 (12 hours) for Direct STS
     sso_enabled: bool = True  # Enable SSO authentication (Okta, Auth0, Azure, Cognito)
 

@@ -541,6 +541,17 @@ class InitCommand(Command):
             config["federation_type"] = federation_type
             config["max_session_duration"] = 43200 if federation_type == "direct" else 28800
 
+            # For Azure, allow reusing an existing OIDC provider to avoid iam:CreateOpenIDConnectProvider
+            if provider_type == "azure":
+                existing_oidc_provider_arn = questionary.text(
+                    "Existing OIDC provider ARN (leave blank to create a new one):",
+                    instruction="(e.g., arn:aws:iam::123456789012:oidc-provider/login.microsoftonline.com/tenant-id/v2.0)",
+                    default=config.get("existing_oidc_provider_arn", ""),
+                ).ask()
+                if existing_oidc_provider_arn is None:
+                    return None
+                config["existing_oidc_provider_arn"] = existing_oidc_provider_arn.strip() or None
+
             # Save progress
             progress.save_step("oidc_complete", config)
 
@@ -1313,15 +1324,18 @@ class InitCommand(Command):
         table.add_column("Setting", style="white", no_wrap=True)
         table.add_column("Value", style="green")
 
-        table.add_row("OIDC Provider", config["okta"]["domain"])
-        table.add_row(
-            "OIDC Client ID",
-            (
-                config["okta"]["client_id"][:20] + "..."
-                if len(config["okta"]["client_id"]) > 20
-                else config["okta"]["client_id"]
-            ),
-        )
+        if config.get("sso_enabled", True) and "okta" in config:
+            table.add_row("OIDC Provider", config["okta"]["domain"])
+            table.add_row(
+                "OIDC Client ID",
+                (
+                    config["okta"]["client_id"][:20] + "..."
+                    if len(config["okta"]["client_id"]) > 20
+                    else config["okta"]["client_id"]
+                ),
+            )
+        else:
+            table.add_row("Authentication", "IAM-based (SSO disabled)")
         table.add_row(
             "Credential Storage",
             (
@@ -1575,6 +1589,7 @@ class InitCommand(Command):
             federation_type=config_data.get("federation_type", "cognito"),
             max_session_duration=config_data.get("max_session_duration", 28800),
             sso_enabled=config_data.get("sso_enabled", True),
+            existing_oidc_provider_arn=config_data.get("existing_oidc_provider_arn"),
             azure_auth_mode=config_data.get("azure_auth_mode"),
             client_certificate_path=config_data.get("client_certificate_path"),
             client_certificate_key_path=config_data.get("client_certificate_key_path"),
@@ -1914,6 +1929,10 @@ class InitCommand(Command):
             # Add analytics configuration if present
             if hasattr(profile, "analytics_enabled"):
                 existing_config["analytics"] = {"enabled": profile.analytics_enabled}
+
+            # Preserve existing OIDC provider ARN if present
+            if getattr(profile, "existing_oidc_provider_arn", None):
+                existing_config["existing_oidc_provider_arn"] = profile.existing_oidc_provider_arn
 
             # Preserve confidential client configuration if present
             # client_secret is never written to config — it lives in the OS keyring

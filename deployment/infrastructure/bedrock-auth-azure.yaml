@@ -49,10 +49,17 @@ Parameters:
       - 'false'
     Description: Enable CloudWatch monitoring for Bedrock usage
 
+  ExistingOIDCProviderArn:
+    Type: String
+    Default: ''
+    Description: ARN of an existing IAM OIDC provider to reuse (e.g. arn:aws:iam::123456789012:oidc-provider/login.microsoftonline.com/tenant-id/v2.0). Leave empty to create a new one.
+
 Conditions:
   UseDirectIAM: !Equals [!Ref FederationType, direct]
   UseCognitoIdentity: !Equals [!Ref FederationType, cognito]
   MonitoringEnabled: !Equals [!Ref EnableMonitoring, 'true']
+  UseExistingOIDCProvider: !Not [!Equals [!Ref ExistingOIDCProviderArn, '']]
+  CreateOIDCProvider: !Equals [!Ref ExistingOIDCProviderArn, '']
   # Partition-aware conditions for Cognito Identity service principals
   IsGovCloudWest: !Equals [!Ref 'AWS::Region', 'us-gov-west-1']
   IsGovCloudEast: !Equals [!Ref 'AWS::Region', 'us-gov-east-1']
@@ -65,6 +72,7 @@ Resources:
 
   AzureOIDCProvider:
     Type: AWS::IAM::OIDCProvider
+    Condition: CreateOIDCProvider
     Properties:
       Url: !Sub 'https://login.microsoftonline.com/${AzureTenantId}/v2.0'
       ClientIdList:
@@ -170,7 +178,10 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Federated: !GetAtt AzureOIDCProvider.Arn
+              Federated: !If
+                - UseExistingOIDCProvider
+                - !Ref ExistingOIDCProviderArn
+                - !GetAtt AzureOIDCProvider.Arn
             Action:
               - 'sts:AssumeRoleWithWebIdentity'
               - 'sts:TagSession'
@@ -196,7 +207,10 @@ Resources:
       AllowUnauthenticatedIdentities: false
       AllowClassicFlow: false
       OpenIdConnectProviderARNs:
-        - !GetAtt AzureOIDCProvider.Arn
+        - !If
+          - UseExistingOIDCProvider
+          - !Ref ExistingOIDCProviderArn
+          - !GetAtt AzureOIDCProvider.Arn
 
   CognitoAuthenticatedRole:
     Type: AWS::IAM::Role
@@ -335,7 +349,10 @@ Outputs:
 
   OIDCProviderArn:
     Description: ARN of the Azure AD OIDC Provider
-    Value: !GetAtt AzureOIDCProvider.Arn
+    Value: !If
+      - UseExistingOIDCProvider
+      - !Ref ExistingOIDCProviderArn
+      - !GetAtt AzureOIDCProvider.Arn
     Export:
       Name: !Sub '${AWS::StackName}-OIDCProviderArn'
 

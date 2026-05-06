@@ -410,12 +410,13 @@ class DeployCommand(Command):
                         # (in case user provided just the GUID but in unexpected format)
                         tenant_id = profile.provider_domain
 
-                    params.extend(
-                        [
-                            f"AzureTenantId={tenant_id}",
-                            f"AzureClientId={profile.client_id}",
-                        ]
-                    )
+                    azure_params = [
+                        f"AzureTenantId={tenant_id}",
+                        f"AzureClientId={profile.client_id}",
+                    ]
+                    if getattr(profile, "existing_oidc_provider_arn", None):
+                        azure_params.append(f"ExistingOIDCProviderArn={profile.existing_oidc_provider_arn}")
+                    params.extend(azure_params)
                 elif provider_type == "cognito":
                     # Extract domain prefix from full domain
                     # e.g., "us-east-1p8mdr8zxe" from "us-east-1p8mdr8zxe.auth.us-east-1.amazoncognito.com"
