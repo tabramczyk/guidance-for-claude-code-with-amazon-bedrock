@@ -24,6 +24,83 @@ from claude_code_with_bedrock.models import (
     get_source_region_for_profile,
 )
 
+# Runtime packages bundled into the credential provider binary.
+_CREDENTIAL_PROVIDER_RUNTIME_DEPS = ["boto3", "requests", "PyJWT", "keyring", "cryptography"]
+_OTEL_HELPER_RUNTIME_DEPS: list[str] = []  # otel_helper uses only stdlib
+_PYINSTALLER_PIN = "pyinstaller==6.*"
+
+
+def _find_universal2_python() -> Path | None:
+    """Return the first universal2 Python ≥3.10 found in the standard python.org install location, or None."""
+    import glob
+
+    candidates = sorted(
+        glob.glob("/Library/Frameworks/Python.framework/Versions/*/bin/python3*"),
+        reverse=True,  # prefer higher versions
+    )
+    for candidate in candidates:
+        p = Path(candidate)
+        if not p.is_file() or not p.stat().st_size:
+            continue
+        result = subprocess.run(["/usr/bin/lipo", "-info", str(p)], capture_output=True, text=True)  # nosec B603 B607
+        if result.returncode != 0:
+            continue
+        out = result.stdout.strip()
+        # universal2 shows "are: x86_64 arm64" or "are: arm64 x86_64"
+        if "are:" in out and "x86_64" in out and "arm64" in out:
+            # Verify version ≥3.10
+            ver = subprocess.run([str(p), "--version"], capture_output=True, text=True)  # nosec B603 B607
+            if ver.returncode == 0:
+                try:
+                    parts = ver.stdout.strip().split()[1].split(".")
+                    if int(parts[0]) >= 3 and int(parts[1]) >= 10:
+                        return p
+                except (IndexError, ValueError):
+                    continue
+    return None
+
+
+def _ensure_cross_arch_venv(arch: str, universal2_python: Path, runtime_packages: list[str], console: Console) -> Path:
+    """Create (or reuse) ~/.ccwb/build-venvs/<arch>/ seeded from a universal2 Python.
+
+    The venv is created under `arch -<arch>` so pip pulls arch-matched wheels for every
+    native extension (cffi, cryptography, etc.). Reused on subsequent runs unless stale.
+    """
+    venv_dir = Path.home() / ".ccwb" / "build-venvs" / arch
+    pyinstaller_bin = venv_dir / "bin" / "pyinstaller"
+    python_bin = venv_dir / "bin" / "python3"
+
+    if pyinstaller_bin.exists() and python_bin.exists():
+        # Validate the venv's Python is actually the right arch
+        result = subprocess.run(["/usr/bin/lipo", "-info", str(python_bin)], capture_output=True, text=True)  # nosec B603 B607
+        if result.returncode == 0 and arch in result.stdout:
+            return venv_dir
+        # Wrong arch — rebuild
+        import shutil
+        console.print(f"[yellow]Rebuilding {arch} build venv (wrong architecture detected)[/yellow]")
+        shutil.rmtree(venv_dir, ignore_errors=True)
+
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    console.print(f"[cyan]Preparing {arch} build venv at {venv_dir} (first run, ~30s)...[/cyan]")
+
+    create = subprocess.run(  # nosec B603 B607
+        ["/usr/bin/arch", f"-{arch}", str(universal2_python), "-m", "venv", str(venv_dir)],
+        capture_output=True, text=True,
+    )
+    if create.returncode != 0:
+        raise RuntimeError(f"Failed to create {arch} build venv: {create.stderr}")
+
+    pip = venv_dir / "bin" / "pip"
+    install = subprocess.run(  # nosec B603 B607
+        ["/usr/bin/arch", f"-{arch}", str(pip), "install", "--quiet", _PYINSTALLER_PIN, *runtime_packages],
+        capture_output=True, text=True,
+    )
+    if install.returncode != 0:
+        raise RuntimeError(f"Failed to install deps into {arch} build venv: {install.stderr or install.stdout}")
+
+    console.print(f"[green]✓ {arch} build venv ready[/green]")
+    return venv_dir
+
 
 class PackageCommand(Command):
     """
@@ -198,25 +275,9 @@ class PackageCommand(Command):
         # Build package
         console.print("\n[bold]Building package...[/bold]")
 
-        # Pre-flight check for Intel builds on ARM Macs
-        if platform.system().lower() == "darwin" and platform.machine().lower() == "arm64":
-            if target_platform in ["macos-intel", "all"]:
-                x86_venv_path = Path.home() / "venv-x86"
-                if not (x86_venv_path.exists() and (x86_venv_path / "bin" / "pyinstaller").exists()):
-                    if target_platform == "macos-intel":
-                        console.print("\n[yellow]⚠️  Intel Mac build environment not found[/yellow]")
-                        console.print("[dim]Intel builds require an x86_64 Python environment on Apple Silicon.[/dim]")
-                        console.print("[dim]ARM64 binaries work on Intel Macs via Rosetta, so this is optional.[/dim]")
-                        console.print("\n[dim]To set up Intel builds (optional):[/dim]")
-                        console.print("[dim]1. Install x86_64 Homebrew:[/dim]")
-                        console.print(
-                            '[dim]   arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"[/dim]'
-                        )
-                        console.print("[dim]2. Install Python and create environment:[/dim]")
-                        console.print("[dim]   arch -x86_64 /usr/local/bin/brew install python@3.12[/dim]")
-                        console.print("[dim]   arch -x86_64 /usr/local/bin/python3.12 -m venv ~/venv-x86[/dim]")
-                        console.print("[dim]   arch -x86_64 ~/venv-x86/bin/pip install pyinstaller boto3 keyring[/dim]")
-                        console.print()
+        # Cross-arch macOS builds auto-create per-arch venvs from a universal2 Python.
+        # Detect once here so both the platforms_to_build assembly and _build_macos_pyinstaller share the same result.
+        _universal2_python = _find_universal2_python() if platform.system().lower() == "darwin" else None
 
         # Build executable(s) using PyInstaller/Docker
         # Handle both list and single platform selection
@@ -230,16 +291,23 @@ class PackageCommand(Command):
                     current_machine = platform.machine().lower()
 
                     if current_os == "darwin":
-                        if current_machine == "arm64":
-                            platforms_to_build.append("macos-arm64")
-                            x86_venv_path = Path.home() / "venv-x86"
-                            if x86_venv_path.exists() and (x86_venv_path / "bin" / "pyinstaller").exists():
-                                platforms_to_build.append("macos-intel")
+                        host_arch = current_machine  # arm64 or x86_64
+                        platforms_to_build.append(f"macos-{'arm64' if host_arch == 'arm64' else 'intel'}")
+                        cross_arch = "x86_64" if host_arch == "arm64" else "arm64"
+                        cross_platform = "macos-intel" if host_arch == "arm64" else "macos-arm64"
+                        if _universal2_python:
+                            platforms_to_build.append(cross_platform)
                         else:
-                            platforms_to_build.append("macos-intel")
+                            console.print(
+                                f"[dim]Note: {cross_platform} skipped — install Python universal2 from python.org to enable.[/dim]"
+                            )
 
-                        docker_check = subprocess.run(["docker", "--version"], capture_output=True)
-                        if docker_check.returncode == 0:
+                        try:
+                            docker_check = subprocess.run(["docker", "--version"], capture_output=True)
+                            docker_available = docker_check.returncode == 0
+                        except FileNotFoundError:
+                            docker_available = False
+                        if docker_available:
                             platforms_to_build.append("linux-x64")
                             platforms_to_build.append("linux-arm64")
                     elif current_os == "linux":
@@ -260,26 +328,23 @@ class PackageCommand(Command):
             current_machine = platform.machine().lower()
 
             if current_os == "darwin":
-                # On macOS, build for current architecture
-                if current_machine == "arm64":
-                    platforms_to_build.append("macos-arm64")
-                    # Check if x86_64 environment is available for Intel builds
-                    x86_venv_path = Path.home() / "venv-x86"
-                    if x86_venv_path.exists() and (x86_venv_path / "bin" / "pyinstaller").exists():
-                        platforms_to_build.append("macos-intel")
-                    else:
-                        # Check if Rosetta is available (for informational message)
-                        rosetta_check = subprocess.run(["arch", "-x86_64", "true"], capture_output=True)
-                        if rosetta_check.returncode == 0:
-                            console.print(
-                                "[dim]Note: Intel Mac builds available with optional setup. See docs for details.[/dim]"
-                            )
+                host_arch = current_machine  # arm64 or x86_64
+                platforms_to_build.append(f"macos-{'arm64' if host_arch == 'arm64' else 'intel'}")
+                cross_platform = "macos-intel" if host_arch == "arm64" else "macos-arm64"
+                if _universal2_python:
+                    platforms_to_build.append(cross_platform)
                 else:
-                    platforms_to_build.append("macos-intel")
+                    console.print(
+                        f"[dim]Note: {cross_platform} skipped — install Python universal2 from python.org to enable.[/dim]"
+                    )
 
                 # Check if Docker is available for Linux builds
-                docker_check = subprocess.run(["docker", "--version"], capture_output=True)
-                if docker_check.returncode == 0:
+                try:
+                    docker_check = subprocess.run(["docker", "--version"], capture_output=True)
+                    docker_available = docker_check.returncode == 0
+                except FileNotFoundError:
+                    docker_available = False
+                if docker_available:
                     platforms_to_build.append("linux-x64")
                     platforms_to_build.append("linux-arm64")
 
@@ -730,44 +795,35 @@ class PackageCommand(Command):
 
         console.print(f"[yellow]Building macOS {arch} binary with PyInstaller...[/yellow]")
 
-        # Check if we need to use x86_64 Python for Intel builds
-        use_x86_python = False
-        x86_venv_path = Path.home() / "venv-x86"
-
-        if arch == "x86_64" and platform.machine().lower() == "arm64":
-            # On ARM Mac building Intel binary - check for x86_64 environment
-            if x86_venv_path.exists() and (x86_venv_path / "bin" / "pyinstaller").exists():
-                use_x86_python = True
-                console.print("[dim]Using x86_64 Python environment for Intel build[/dim]")
-            else:
-                console.print("\n[yellow]⚠️  Intel Mac build skipped (optional)[/yellow]")
-                console.print("[dim]Intel binaries are optional. ARM64 binaries work on Intel Macs via Rosetta.[/dim]")
-                console.print("[dim]To enable Intel builds on Apple Silicon, see:[/dim]")
-                console.print(
-                    "[dim]https://github.com/aws-solutions-library-samples/guidance-for-claude-code-with-amazon-bedrock#optional-intel-mac-builds[/dim]\n"
-                )
-                # Return dummy path - the main loop will handle this gracefully
-                return output_dir / binary_name
+        host_arch = platform.machine().lower()
+        cross_arch = arch != host_arch and arch != "universal2"
 
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
-        # Build PyInstaller command
-        if use_x86_python:
-            # Use x86_64 Python environment
+        if cross_arch:
+            # Cross-arch build: need a per-arch venv seeded from a universal2 Python
+            universal2_python = _find_universal2_python()
+            if universal2_python is None:
+                raise RuntimeError(
+                    f"Cross-arch macOS build requires a universal2 Python but none was found.\n\n"
+                    f"Install Python universal2 from python.org:\n"
+                    f"  https://www.python.org/downloads/macos/\n\n"
+                    f"Download the 'macOS 64-bit universal2 installer' for Python 3.12, then re-run.\n\n"
+                    f"To build only the host arch ({host_arch}), omit the cross-arch target."
+                )
+            venv_dir = _ensure_cross_arch_venv(arch, universal2_python, _CREDENTIAL_PROVIDER_RUNTIME_DEPS, console)
+            work_root = Path.home() / ".ccwb" / "build-work"
+            work_root.mkdir(parents=True, exist_ok=True)
             cmd = [
-                "arch",
-                "-x86_64",
-                str(x86_venv_path / "bin" / "pyinstaller"),
-                "--onefile",
-                "--clean",
-                "--noconfirm",
+                "/usr/bin/arch", f"-{arch}",
+                str(venv_dir / "bin" / "pyinstaller"),
+                "--onefile", "--clean", "--noconfirm",
                 f"--name={binary_name}",
                 f"--distpath={str(output_dir)}",
-                "--workpath=/tmp/pyinstaller-x86",
-                "--specpath=/tmp/pyinstaller-x86",
+                f"--workpath={str(work_root / arch)}",
+                f"--specpath={str(work_root / arch)}",
                 f"--log-level={log_level}",
-                # Hidden imports for our dependencies
                 "--hidden-import=keyring.backends.macOS",
                 "--hidden-import=keyring.backends.SecretService",
                 "--hidden-import=keyring.backends.Windows",
@@ -775,21 +831,16 @@ class PackageCommand(Command):
                 str(src_file),
             ]
         else:
-            # Use regular Poetry environment
+            # Native build: use Poetry environment directly
             cmd = [
-                "poetry",
-                "run",
-                "pyinstaller",
-                "--onefile",
-                "--clean",
-                "--noconfirm",
+                "poetry", "run", "pyinstaller",
+                "--onefile", "--clean", "--noconfirm",
                 f"--target-arch={arch}",
                 f"--name={binary_name}",
                 f"--distpath={str(output_dir)}",
                 "--workpath=/tmp/pyinstaller",
                 "--specpath=/tmp/pyinstaller",
                 f"--log-level={log_level}",
-                # Hidden imports for our dependencies
                 "--hidden-import=keyring.backends.macOS",
                 "--hidden-import=keyring.backends.SecretService",
                 "--hidden-import=keyring.backends.Windows",
@@ -895,8 +946,12 @@ class PackageCommand(Command):
             binary_name = "credential-process-linux-x64"
 
         # Check if Docker is available and running
-        docker_check = subprocess.run(["docker", "--version"], capture_output=True)
-        if docker_check.returncode != 0:
+        try:
+            docker_check = subprocess.run(["docker", "--version"], capture_output=True)
+            docker_installed = docker_check.returncode == 0
+        except FileNotFoundError:
+            docker_installed = False
+        if not docker_installed:
             console.print(f"\n[yellow]⚠️  Docker not found - skipping Linux {arch} build[/yellow]")
             console.print("[dim]Linux binaries require Docker Desktop to be installed and running.[/dim]")
             console.print("[dim]Install Docker: https://docs.docker.com/get-docker/[/dim]")
@@ -1089,8 +1144,12 @@ RUN pyinstaller \
             binary_name = "otel-helper-linux-x64"
 
         # Check if Docker is available and running
-        docker_check = subprocess.run(["docker", "--version"], capture_output=True)
-        if docker_check.returncode != 0:
+        try:
+            docker_check = subprocess.run(["docker", "--version"], capture_output=True)
+            docker_installed = docker_check.returncode == 0
+        except FileNotFoundError:
+            docker_installed = False
+        if not docker_installed:
             console.print(f"\n[yellow]⚠️  Docker not found - skipping Linux {arch} OTEL helper build[/yellow]")
             console.print("[dim]Linux binaries require Docker Desktop to be installed and running.[/dim]")
             console.print(f"[dim]Skipping otel-helper-linux-{arch}[/dim]\n")
@@ -1497,50 +1556,37 @@ RUN pyinstaller \
 
         console.print(f"[yellow]Building OTEL helper for {platform_name} {arch or ''} with PyInstaller...[/yellow]")
 
-        # Check if we need to use x86_64 Python for Intel builds on macOS
-        use_x86_python = False
-        x86_venv_path = Path.home() / "venv-x86"
-
-        if platform_name == "macos" and arch == "x86_64" and platform_module.machine().lower() == "arm64":
-            # On ARM Mac building Intel binary - check for x86_64 environment
-            if x86_venv_path.exists() and (x86_venv_path / "bin" / "pyinstaller").exists():
-                use_x86_python = True
-                console.print("[dim]Using x86_64 Python environment for Intel OTEL helper build[/dim]")
-            else:
-                console.print("[yellow]Warning: x86_64 Python environment not found at ~/venv-x86[/yellow]")
-                console.print("[yellow]Skipping Intel OTEL helper build[/yellow]")
-                # For OTEL helper, we can skip if not available (it's optional)
-                return output_dir / binary_name  # Return expected path even if not built
-
         # Determine log level based on verbose flag
         log_level = "INFO" if verbose else "WARN"
 
+        host_arch = platform_module.machine().lower()
+        cross_arch = platform_name == "macos" and arch is not None and arch != host_arch and arch != "universal2"
+
         # Build PyInstaller command
-        if use_x86_python:
-            # Use x86_64 Python environment
+        if cross_arch:
+            # Cross-arch build: need a per-arch venv seeded from a universal2 Python
+            universal2_python = _find_universal2_python()
+            if universal2_python is None:
+                console.print(f"[yellow]Warning: Skipping {binary_name} — cross-arch build requires universal2 Python (not found)[/yellow]")
+                return output_dir / binary_name
+            venv_dir = _ensure_cross_arch_venv(arch, universal2_python, _OTEL_HELPER_RUNTIME_DEPS, console)
+            work_root = Path.home() / ".ccwb" / "build-work"
+            work_root.mkdir(parents=True, exist_ok=True)
             cmd = [
-                "arch",
-                "-x86_64",
-                str(x86_venv_path / "bin" / "pyinstaller"),
-                "--onefile",
-                "--clean",
-                "--noconfirm",
+                "/usr/bin/arch", f"-{arch}",
+                str(venv_dir / "bin" / "pyinstaller"),
+                "--onefile", "--clean", "--noconfirm",
                 f"--name={binary_name}",
                 f"--distpath={str(output_dir)}",
-                "--workpath=/tmp/pyinstaller-x86",
-                "--specpath=/tmp/pyinstaller-x86",
+                f"--workpath={str(work_root / arch)}",
+                f"--specpath={str(work_root / arch)}",
                 f"--log-level={log_level}",
                 str(src_file),
             ]
         else:
-            # Use regular Poetry environment
             cmd = [
-                "poetry",
-                "run",
-                "pyinstaller",
-                "--onefile",
-                "--clean",
-                "--noconfirm",
+                "poetry", "run", "pyinstaller",
+                "--onefile", "--clean", "--noconfirm",
                 f"--name={binary_name}",
                 f"--distpath={str(output_dir)}",
                 "--workpath=/tmp/pyinstaller",
@@ -1549,8 +1595,8 @@ RUN pyinstaller \
                 str(src_file),
             ]
 
-        # Add target architecture for macOS (only for regular Poetry environment)
-        if not use_x86_python and platform_name == "macos" and arch:
+        # Add target architecture for macOS (only for native Poetry build)
+        if not cross_arch and platform_name == "macos" and arch:
             cmd.insert(5, f"--target-arch={arch}")
 
         # Run PyInstaller from source directory
@@ -1816,16 +1862,6 @@ echo "Organization: {profile.provider_domain}"
 echo
 
 
-# Check prerequisites
-echo "Checking prerequisites..."
-
-if ! command -v aws &> /dev/null; then
-    echo "❌ AWS CLI is not installed"
-    echo "   Please install from https://aws.amazon.com/cli/"
-    exit 1
-fi
-
-echo "✓ Prerequisites found"
 
 # Detect platform and architecture
 echo
@@ -1983,6 +2019,13 @@ for PROFILE_NAME in $PROFILES; do
     # Remove old profile if exists
     sed -i.bak "/\\[profile $PROFILE_NAME\\]/,/^$/d" ~/.aws/config 2>/dev/null || true
 
+    # Purge any stale stanza from ~/.aws/credentials. The credential chain
+    # resolves that file before credential_process in ~/.aws/config, so a
+    # leftover [PROFILE_NAME] block (e.g. EXPIRED placeholder written by an
+    # older ccwb auth logout) would shadow credential_process and break
+    # Cowork Desktop with a 403 InvalidClientTokenId.
+    sed -i.bak "/\\[$PROFILE_NAME\\]/,/^$/d" ~/.aws/credentials 2>/dev/null || true
+
     # Get profile-specific region from config.json
     PROFILE_REGION=$(python3 -c "import json; print(json.load(open('config.json')).get('$PROFILE_NAME', \
     {{}}).get('aws_region', '$DEFAULT_REGION'))")
@@ -1996,6 +2039,22 @@ EOF
     echo "  ✓ Created AWS profile '$PROFILE_NAME'"
 done
 
+# Apply CoWork configuration profile on macOS if present
+if [[ "$OSTYPE" == "darwin"* ]] && [ -f "cowork-3p.mobileconfig" ]; then
+    echo
+    echo "Applying CoWork configuration profile..."
+    # `open` launches System Settings > Profiles so the user can review and
+    # click Install. macOS does not allow silent installation of unsigned
+    # configuration profiles without MDM enrollment.
+    if open "cowork-3p.mobileconfig" 2>/dev/null; then
+        echo "✓ CoWork configuration profile opened in System Settings"
+        echo "  → Click 'Install' to complete CoWork 3P setup"
+    else
+        echo "⚠️  Could not open cowork-3p.mobileconfig automatically"
+        echo "   Double-click the file to install it manually"
+    fi
+fi
+
 echo
 echo "======================================"
 echo "✓ Installation complete!"
@@ -2008,12 +2067,12 @@ done
 echo
 echo "To use Claude Code authentication:"
 echo "  export AWS_PROFILE=<profile-name>"
-echo "  aws sts get-caller-identity"
+echo "  claude"
 echo
 echo "Example:"
 FIRST_PROFILE=$(echo $PROFILES | awk '{{print $1}}')
 echo "  export AWS_PROFILE=$FIRST_PROFILE"
-echo "  aws sts get-caller-identity"
+echo "  claude"
 echo
 echo "Note: Authentication will automatically open your browser when needed."
 echo
@@ -2034,6 +2093,7 @@ echo
         """Create Windows batch installer script."""
 
         installer_content = f"""@echo off
+SETLOCAL ENABLEDELAYEDEXPANSION
 REM Claude Code Authentication Installer for Windows
 REM Organization: {profile.provider_domain}
 REM Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -2043,20 +2103,6 @@ echo Claude Code Authentication Installer
 echo ======================================
 echo.
 echo Organization: {profile.provider_domain}
-echo.
-
-REM Check prerequisites
-echo Checking prerequisites...
-
-where aws >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ERROR: AWS CLI is not installed
-    echo        Please install from https://aws.amazon.com/cli/
-    pause
-    exit /b 1
-)
-
-echo OK Prerequisites found
 echo.
 
 REM Create directory
@@ -2082,6 +2128,20 @@ REM Copy configuration
 echo Copying configuration...
 copy /Y "config.json" "%USERPROFILE%\\claude-code-with-bedrock\\" >nul
 
+REM Apply CoWork registry settings if present
+if exist "cowork-3p.reg" (
+    echo Applying CoWork registry settings...
+    REM Remove the policy key first so stale values (e.g. old inferenceCredentialHelper)
+    REM don't linger alongside the new config — regedit /s only adds/updates, never deletes.
+    reg delete "HKCU\\SOFTWARE\\Policies\\Claude" /f >nul 2>&1
+    regedit /s "cowork-3p.reg"
+    if %errorlevel% neq 0 (
+        echo WARNING: Failed to apply CoWork registry settings
+    ) else (
+        echo OK CoWork registry settings applied
+    )
+)
+
 REM Copy Claude Code settings if they exist
 if exist "claude-settings" (
     echo Copying Claude Code telemetry settings...
@@ -2101,47 +2161,30 @@ if exist "claude-settings" (
 
         if not "%SKIP_SETTINGS%"=="true" (
             REM Use PowerShell to replace placeholders
-            powershell -Command ^
-            "$otelPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\otel-helper.exe' ^
-            -replace '\\\\\\\\', '/'; ^
-            $credPath = '%USERPROFILE%\\\\claude-code-with-bedrock\\\\credential-process.exe' ^
-            -replace '\\\\\\\\', '/'; ^
-            (Get-Content 'claude-settings\\\\settings.json') ^
-            -replace '__OTEL_HELPER_PATH__', $otelPath ^
-            -replace '__CREDENTIAL_PROCESS_PATH__', $credPath | ^
-            Set-Content '%USERPROFILE%\\\\.claude\\\\settings.json'"
+            powershell -Command "$otelPath = $env:USERPROFILE + '\\claude-code-with-bedrock\\otel-helper.exe' -replace '\\\\', '/'; $credPath = $env:USERPROFILE + '\\claude-code-with-bedrock\\credential-process.exe' -replace '\\\\', '/'; (Get-Content 'claude-settings\\settings.json') -replace '__OTEL_HELPER_PATH__', $otelPath -replace '__CREDENTIAL_PROCESS_PATH__', $credPath | Set-Content (Join-Path $env:USERPROFILE '.claude\\settings.json')"
             echo OK Claude Code settings configured
         )
     )
 )
 
-REM Configure AWS profiles
+REM Configure AWS profiles by writing ~/.aws/config directly (no AWS CLI dependency)
 echo.
 echo Configuring AWS profiles...
 
-REM Read profiles from config.json using PowerShell
-for /f %%p in ('powershell -Command ^
-"& {{$c=Get-Content config.json|ConvertFrom-Json;$c.PSObject.Properties.Name}}"') do (
-    echo Configuring AWS profile: %%p
+if not exist "%USERPROFILE%\\.aws" mkdir "%USERPROFILE%\\.aws"
 
-    REM Get profile-specific region
-    for /f %%r in ('powershell -Command ^
-    "& {{$c=Get-Content config.json|ConvertFrom-Json;$c.'%%p'.aws_region}}"') do set PROFILE_REGION=%%r
+REM Purge any stale stanza from %USERPROFILE%\.aws\credentials. The credential
+REM chain resolves that file before credential_process in %USERPROFILE%\.aws\config,
+REM so a leftover [profile-name] block (e.g. EXPIRED placeholder written by an
+REM older ccwb auth logout) would shadow credential_process and break Cowork
+REM Desktop with a 403 InvalidClientTokenId.
+powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $awsCreds = Join-Path $env:USERPROFILE '.aws\credentials'; if (Test-Path $awsCreds) {{ $cfg = Get-Content config.json | ConvertFrom-Json; $existing = Get-Content $awsCreds -Raw; foreach ($p in $cfg.PSObject.Properties.Name) {{ $pattern = '(?ms)^\[' + [regex]::Escape($p) + '\].*?(?=^\[|\Z)'; $existing = [regex]::Replace($existing, $pattern, '') }}; Set-Content -Path $awsCreds -Value $existing.TrimStart() -NoNewline -Encoding ASCII }}"
 
-
-    REM Set credential process with --profile flag (cross-platform, no wrapper needed)
-    aws configure set credential_process ^
-    "%USERPROFILE%\\claude-code-with-bedrock\\credential-process.exe --profile %%p" --profile %%p
-
-
-    REM Set region
-    if defined PROFILE_REGION (
-        aws configure set region !PROFILE_REGION! --profile %%p
-    ) else (
-        aws configure set region {profile.aws_region} --profile %%p
-    )
-
-    echo   OK Created AWS profile '%%p'
+powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $nl = [char]13 + [char]10; $cfg = Get-Content config.json | ConvertFrom-Json; $awsConfig = Join-Path $env:USERPROFILE '.aws\config'; $credProcess = Join-Path $env:USERPROFILE 'claude-code-with-bedrock\credential-process.exe'; $existing = if (Test-Path $awsConfig) {{ Get-Content $awsConfig -Raw }} else {{ '' }}; foreach ($p in $cfg.PSObject.Properties.Name) {{ $region = $cfg.$p.aws_region; if (-not $region) {{ $region = '{profile.aws_region}' }}; $pattern = '(?ms)^\[profile ' + [regex]::Escape($p) + '\].*?(?=^\[|\Z)'; $existing = [regex]::Replace($existing, $pattern, ''); $stanza = '[profile ' + $p + ']' + $nl + 'credential_process = ' + $credProcess + ' --profile ' + $p + $nl + 'region = ' + $region + $nl; $existing = $existing.TrimEnd() + $nl + $nl + $stanza; Write-Host ('  OK Configured AWS profile ' + $p) }}; Set-Content -Path $awsConfig -Value $existing.TrimStart() -NoNewline -Encoding ASCII"
+if %errorlevel% neq 0 (
+    echo ERROR: Failed to configure AWS profiles
+    pause
+    exit /b 1
 )
 
 echo.
@@ -2150,20 +2193,18 @@ echo Installation complete!
 echo ======================================
 echo.
 echo Available profiles:
-for /f %%p in ('powershell -Command ^
-"$config = Get-Content config.json | ConvertFrom-Json; $config.PSObject.Properties.Name"') do (
+for /f %%p in ('powershell -NoProfile -Command "(Get-Content config.json | ConvertFrom-Json).PSObject.Properties.Name"') do (
     echo   - %%p
 )
 echo.
 echo To use Claude Code authentication:
 echo   set AWS_PROFILE=^<profile-name^>
-echo   aws sts get-caller-identity
+echo   claude
 echo.
 echo Example:
-for /f %%p in ('powershell -Command ^
-"$config = Get-Content config.json | ConvertFrom-Json; $config.PSObject.Properties.Name | Select-Object -First 1"') do (
+for /f %%p in ('powershell -NoProfile -Command "(Get-Content config.json | ConvertFrom-Json).PSObject.Properties.Name | Select-Object -First 1"') do (
     echo   set AWS_PROFILE=%%p
-    echo   aws sts get-caller-identity
+    echo   claude
 )
 echo.
 echo Note: Authentication will automatically open your browser when needed.
@@ -2200,7 +2241,7 @@ pause
 3. Use the AWS profile:
    ```bash
    export AWS_PROFILE=ClaudeCode
-   aws sts get-caller-identity
+   claude
    ```
 
 ### Windows
@@ -2245,39 +2286,34 @@ install.bat
 ```
 
 The installer will:
-- Check for AWS CLI installation
 - Copy authentication tools to `%USERPROFILE%\\claude-code-with-bedrock`
-- Configure the AWS profile "ClaudeCode"
-- Test the authentication
+- Configure the AWS profile "ClaudeCode" in `%USERPROFILE%\\.aws\\config`
+- Apply CoWork registry settings (if included)
 
 #### Step 4: Use Claude Code
 ```cmd
 # Set the AWS profile
 set AWS_PROFILE=ClaudeCode
 
-# Verify authentication works
-aws sts get-caller-identity
-
-# Your browser will open automatically for authentication if needed
+# Run Claude Code (authentication opens your browser on first use)
+claude
 ```
 
 For PowerShell users:
 ```powershell
 $env:AWS_PROFILE = "ClaudeCode"
-aws sts get-caller-identity
+claude
 ```
 
 ## What This Does
 
 - Installs the Claude Code authentication tools
-- Configures your AWS CLI to use {profile.provider_domain} for authentication
+- Configures an AWS named profile in `~/.aws/config` (or `%USERPROFILE%\\.aws\\config`) that points at the bundled `credential-process` binary
 - Sets up automatic credential refresh via your browser
 
 ## Requirements
 
-- Python 3.8 or later
-- AWS CLI v2
-- pip3
+- Claude Code CLI (`claude`)
 
 ## Troubleshooting
 
@@ -2364,6 +2400,11 @@ Available metrics include:
                     "CLAUDE_CODE_USE_BEDROCK": "1",
                     # AWS_PROFILE is used by both AWS SDK and otel-helper
                     "AWS_PROFILE": profile_name,
+                    # AWS_CREDENTIAL_PROCESS allows the AWS SDK to obtain credentials
+                    # directly without requiring the AWS CLI or ~/.aws/config.
+                    # The __CREDENTIAL_PROCESS_PATH__ placeholder is replaced by
+                    # install.sh/install.bat with the actual binary path at install time.
+                    "AWS_CREDENTIAL_PROCESS": f"__CREDENTIAL_PROCESS_PATH__ --profile {profile_name}",
                 }
             }
 
@@ -2485,7 +2526,6 @@ Available metrics include:
             build_mdm_config,
             derive_model_aliases,
             generate_all,
-            generate_credential_helper_wrapper,
         )
 
         console = Console()
@@ -2500,7 +2540,6 @@ Available metrics include:
                 profile_name=profile_name,
             )
 
-            generate_credential_helper_wrapper(profile_name, bedrock_region)
             add_monitoring_config(mdm_config, profile, console)
             generate_all(output_dir, mdm_config, console)
 
