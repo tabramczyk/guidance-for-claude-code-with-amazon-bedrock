@@ -1850,18 +1850,26 @@ class MultiProviderAuth:
             # Check cache first
             cached = self.get_cached_credentials()
             if cached:
-                # Periodic quota re-check even with cached credentials
-                if self._should_recheck_quota():
-                    self._debug_print("Performing periodic quota re-check...")
+                # Always check quota when configured — interval only skips warnings, never blocks
+                if self._should_check_quota():
                     id_token = self.get_monitoring_token()
                     token_claims = self._get_cached_token_claims()
                     if id_token and token_claims:
-                        quota_result = self._check_quota(token_claims, id_token)
-                        self._save_quota_check_timestamp()
-                        if not quota_result.get("allowed", True):
-                            return self._handle_quota_blocked(quota_result)
+                        recheck = self._should_recheck_quota()
+                        if recheck:
+                            self._debug_print("Performing periodic quota re-check...")
+                            quota_result = self._check_quota(token_claims, id_token)
+                            self._save_quota_check_timestamp()
+                            if not quota_result.get("allowed", True):
+                                return self._handle_quota_blocked(quota_result)
+                            else:
+                                self._handle_quota_warning(quota_result)
                         else:
-                            self._handle_quota_warning(quota_result)
+                            # Outside recheck interval — still enforce block if cached result exists
+                            self._debug_print("Checking cached quota block status...")
+                            quota_result = self._check_quota(token_claims, id_token)
+                            if not quota_result.get("allowed", True):
+                                return self._handle_quota_blocked(quota_result)
                     else:
                         self._debug_print("No cached token for quota re-check, skipping")
 

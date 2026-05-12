@@ -2143,29 +2143,22 @@ if exist "cowork-3p.reg" (
 )
 
 REM Copy Claude Code settings if they exist
-if exist "claude-settings" (
-    echo Copying Claude Code telemetry settings...
-    if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"
-
-    REM Copy settings and replace placeholders
-    if exist "claude-settings\\settings.json" (
-        set SKIP_SETTINGS=false
-        if exist "%USERPROFILE%\\.claude\\settings.json" (
-            echo Existing Claude Code settings found
-            set /p OVERWRITE="Overwrite with new settings? (y/n): "
-            if /i not "%OVERWRITE%"=="y" (
-                echo Skipping Claude Code settings...
-                set SKIP_SETTINGS=true
-            )
-        )
-
-        if not "%SKIP_SETTINGS%"=="true" (
-            REM Use PowerShell to replace placeholders
-            powershell -Command "$otelPath = $env:USERPROFILE + '\\claude-code-with-bedrock\\otel-helper.exe' -replace '\\\\', '/'; $credPath = $env:USERPROFILE + '\\claude-code-with-bedrock\\credential-process.exe' -replace '\\\\', '/'; (Get-Content 'claude-settings\\settings.json') -replace '__OTEL_HELPER_PATH__', $otelPath -replace '__CREDENTIAL_PROCESS_PATH__', $credPath | Set-Content (Join-Path $env:USERPROFILE '.claude\\settings.json')"
-            echo OK Claude Code settings configured
-        )
+set SKIP_SETTINGS=true
+if exist "claude-settings\\settings.json" set SKIP_SETTINGS=false
+if "!SKIP_SETTINGS!"=="true" goto :after_settings
+echo Copying Claude Code telemetry settings...
+if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"
+if exist "%USERPROFILE%\\.claude\\settings.json" (
+    echo Existing Claude Code settings found
+    set /p OVERWRITE="Overwrite with new settings? (y/n): "
+    if /i not "!OVERWRITE!"=="y" (
+        echo Skipping Claude Code settings...
+        goto :after_settings
     )
 )
+powershell -Command "$otelPath = $env:USERPROFILE + '\\claude-code-with-bedrock\\otel-helper.exe' -replace '\\\\', '/'; $credPath = $env:USERPROFILE + '\\claude-code-with-bedrock\\credential-process.exe' -replace '\\\\', '/'; (Get-Content 'claude-settings\\settings.json') -replace '__OTEL_HELPER_PATH__', $otelPath -replace '__CREDENTIAL_PROCESS_PATH__', $credPath | Set-Content (Join-Path $env:USERPROFILE '.claude\\settings.json')"
+echo OK Claude Code settings configured
+:after_settings
 
 REM Configure AWS profiles by writing ~/.aws/config directly (no AWS CLI dependency)
 echo.
